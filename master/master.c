@@ -1437,14 +1437,17 @@ void ec_master_nanosleep(const unsigned long nsecs)
 /****************************************************************************/
 
 /** Execute slave FSMs.
+ *
+ * Returns non-zero, if at least one slave FSM is busy.
  */
-void ec_master_exec_slave_fsms(
+int ec_master_exec_slave_fsms(
         ec_master_t *master /**< EtherCAT master. */
         )
 {
     ec_datagram_t *datagram;
     ec_fsm_slave_t *fsm, *next;
     unsigned int count = 0;
+    int busy = 0;
 
     list_for_each_entry_safe(fsm, next, &master->fsm_exec_list, list) {
         if (!fsm->datagram) {
@@ -1452,7 +1455,7 @@ void ec_master_exec_slave_fsms(
                     "This is a bug!\n", fsm->slave->ring_position);
             list_del_init(&fsm->list);
             master->fsm_exec_count--;
-            return;
+            return 1;
         }
 
         if (fsm->datagram->state == EC_DATAGRAM_INIT ||
@@ -1460,7 +1463,7 @@ void ec_master_exec_slave_fsms(
                 fsm->datagram->state == EC_DATAGRAM_SENT) {
             // previous datagram was not sent or received yet.
             // wait until next thread execution
-            return;
+            return 1;
         }
 
         datagram = ec_master_get_external_datagram(master);
@@ -1483,6 +1486,7 @@ void ec_master_exec_slave_fsms(
 #endif
             master->ext_ring_idx_fsm =
                 (master->ext_ring_idx_fsm + 1) % EC_EXT_RING_SIZE;
+            busy = 1;
         }
         else {
             // FSM finished
@@ -1507,6 +1511,7 @@ void ec_master_exec_slave_fsms(
                 list_add_tail(&master->fsm_slave->fsm.list,
                         &master->fsm_exec_list);
                 master->fsm_exec_count++;
+                busy = 1;
 #if DEBUG_INJECT
                 EC_MASTER_DBG(master, 1, "New slave %u FSM"
                         " consumed datagram %s, now %u FSMs in list.\n",
@@ -1522,6 +1527,8 @@ void ec_master_exec_slave_fsms(
         }
         count++;
     }
+
+    return busy;
 }
 
 /****************************************************************************/
@@ -1531,7 +1538,7 @@ void ec_master_exec_slave_fsms(
 static int ec_master_idle_thread(void *priv_data)
 {
     ec_master_t *master = (ec_master_t *) priv_data;
-    int fsm_exec;
+    int fsm_exec, slave_fsms_busy;
 #ifdef EC_USE_HRTIMER
     size_t sent_bytes;
 #endif
@@ -1559,7 +1566,7 @@ static int ec_master_idle_thread(void *priv_data)
 
         fsm_exec = ec_fsm_master_exec(&master->fsm);
 
-        ec_master_exec_slave_fsms(master);
+        slave_fsms_busy = ec_master_exec_slave_fsms(master);
 
         up(&master->master_sem);
 
@@ -1576,7 +1583,7 @@ static int ec_master_idle_thread(void *priv_data)
 #endif
         rt_mutex_unlock(&master->io_mutex);
 
-        if (ec_fsm_master_idle(&master->fsm)) {
+        if (ec_fsm_master_idle(&master->fsm) && !slave_fsms_busy) {
 #ifdef EC_USE_HRTIMER
             ec_master_nanosleep(master->send_interval * 1000);
 #else
@@ -1604,6 +1611,7 @@ static int ec_master_idle_thread(void *priv_data)
 static int ec_master_operation_thread(void *priv_data)
 {
     ec_master_t *master = (ec_master_t *) priv_data;
+    int slave_fsms_busy;
 
     EC_MASTER_DBG(master, 1, "Operation thread running"
             " with fsm interval = %u us, max data size=%zu\n",
@@ -1611,6 +1619,8 @@ static int ec_master_operation_thread(void *priv_data)
 
     while (!kthread_should_stop()) {
         ec_datagram_output_stats(&master->fsm_datagram);
+
+        slave_fsms_busy = 0;
 
         if (master->injection_seq_rt == master->injection_seq_fsm) {
             // output statistics
@@ -1627,7 +1637,7 @@ static int ec_master_operation_thread(void *priv_data)
                 master->injection_seq_fsm++;
             }
 
-            ec_master_exec_slave_fsms(master);
+            slave_fsms_busy = ec_master_exec_slave_fsms(master);
 
             up(&master->master_sem);
         }
@@ -1636,7 +1646,7 @@ static int ec_master_operation_thread(void *priv_data)
         // the op thread should not work faster than the sending RT thread
         ec_master_nanosleep(master->send_interval * 1000);
 #else
-        if (ec_fsm_master_idle(&master->fsm)) {
+        if (ec_fsm_master_idle(&master->fsm) && !slave_fsms_busy) {
             set_current_state(TASK_INTERRUPTIBLE);
             schedule_timeout(1);
         }
