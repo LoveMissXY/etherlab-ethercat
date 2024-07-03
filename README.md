@@ -1,5 +1,7 @@
 This is the README file of the IgH EtherCAT Master.
 
+https://gitlab.com/etherlab.org/ethercat
+
 vim: spelllang=en spell tw=78
 
 Contents:
